@@ -4,8 +4,8 @@
 #
 # SWANK client for Slimv
 # swank.py:     SWANK client code for slimv.vim plugin
-# Version:      0.9.5
-# Last Change:  07 Mar 2012
+# Version:      0.9.9
+# Last Change:  25 Sep 2012
 # Maintainer:   Tamas Kovacs <kovisoft at gmail dot com>
 # License:      This file is placed in the public domain.
 #               No warranty, express or implied.
@@ -33,6 +33,7 @@ log             = False         # Set this to True in order to enable logging
 logfile         = 'swank.log'   # Logfile name in case logging is on
 pid             = '0'           # Process id
 current_thread  = '0'
+use_unicode     = True          # Use unicode message length counting
 debug_active    = False         # Swank debugger is active
 debug_activated = False         # Swank debugger was activated
 read_string     = None          # Thread and tag in Swank read string mode
@@ -43,6 +44,7 @@ actions         = dict()        # Swank actions (like ':write-string'), by messa
 indent_info     = dict()        # Data of :indentation-update
 frame_locals    = dict()        # Map frame variable names to their index
 inspect_content = []            # Partial content of the last Inspect command
+inspect_package = ''            # Package used for the current Inspector
 
 
 ###############################################################################
@@ -277,7 +279,10 @@ def parse_location(lst):
     return 'no source line information'
 
 def unicode_len(text):
-    return len(unicode(text, "utf-8"))
+    if use_unicode:
+        return len(unicode(text, "utf-8"))
+    else:
+        return len(text)
 
 def swank_send(text):
     global sock
@@ -359,7 +364,7 @@ def swank_parse_inspect_content(pcont):
     """
     global inspect_content
 
-    cur_line = vim.eval('line(".")')
+    vim.command('let oldpos=winsaveview()')
     buf = vim.current.buffer
     # First 2 lines are filled in swank_parse_inspect()
     buf[2:] = []
@@ -374,20 +379,15 @@ def swank_parse_inspect_content(pcont):
         logprint(str(el))
         if type(el) == list:
             if el[0] == ':action':
-                item = '<' + unquote(el[2]) + '> '
+                item = '{<' + unquote(el[2]) + '>'
+                tail = '<>}'
             else:
-                item = '[' + unquote(el[2]) + '] '
-            if linestart < 0:
-                lst.append("\n")
-                linestart = len(lst)
-            lst.insert(linestart, item)
+                item = '{[' + unquote(el[2]) + ']'
+                tail = '[]}'
+            lst.insert(len(lst), item)
             linestart = -1
             text = unquote(el[1])
-            if text[-len(item):] == ' ' * len(item):
-                # If possible, remove spaces from the end in the length of item info
-                lst.append(text[:-len(item)])
-            else:
-                lst.append(text)
+            lst.append(text + tail)
         else:
             text = unquote(el)
             lst.append(text)
@@ -395,23 +395,32 @@ def swank_parse_inspect_content(pcont):
                 linestart = len(lst)
     if int(istate) > int(end):
         # Swank returns end+1000 if there are more entries to request
-        # Save current range for the next request
-        vc = ":let b:range_start=" + start
-        vim.command(vc)
-        vc = ":let b:range_end=" + end
-        vim.command(vc)
         if linestart >= 0 and linestart < len(lst) and (len(lst[linestart]) == 0 or lst[linestart][0] != '['):
             lst[linestart:] = "[--more--]"
         else:
             lst.append("\n[--more--]")
+        lst.append("\n[--all---]")
     buf = vim.current.buffer
     buf.append([''])
     buf.append("".join(lst).split("\n"))
-    buf.append(['', '[<<]'])
-    vim.command('normal! ' + cur_line + 'G')
+    inspect_path = vim.eval('s:inspect_path')
+    if len(inspect_path) > 1:
+        ret = '[<<] Return to ' + ' -> '.join(inspect_path[:-1])
+    else:
+        ret = '[<<] Exit Inspector'
+    buf.append(['', ret])
     vim.command('normal! 3G0')
     vim.command('call SlimvHelp(2)')
-    vim.command('normal! j')
+    vim.command('call winrestview(oldpos)')
+    if int(istate) > int(end):
+        # There are more entries to request
+        # Save current range for the next request
+        vim.command("let b:range_start=" + start)
+        vim.command("let b:range_end=" + end)
+        vim.command("let b:inspect_more=" + end)
+    else:
+        # No ore entries left
+        vim.command("let b:inspect_more=0")
 
 def swank_parse_inspect(struct):
     """
@@ -606,6 +615,7 @@ def swank_parse_locals(struct, action):
 
 def swank_listen():
     global output_port
+    global use_unicode
     global debug_active
     global debug_activated
     global read_string
@@ -741,11 +751,17 @@ def swank_listen():
                                 conn_info = make_keys(params)
                                 pid = conn_info[':pid']
                                 ver = conn_info.get(':version', 'nil')
+                                if len(ver) == 8:
+                                    # Convert version to YYYY-MM-DD format
+                                    ver = ver[0:4] + '-' + ver[4:6] + '-' + ver[6:8]
                                 imp = make_keys( conn_info[':lisp-implementation'] )
                                 pkg = make_keys( conn_info[':package'] )
                                 package = pkg[':name']
                                 prompt = pkg[':prompt']
                                 vim.command('let s:swank_version="' + ver + '"')
+                                if ver >= '2011-11-08':
+                                    # Recent swank servers count bytes instead of unicode characters
+                                    use_unicode = False
                                 vim.command('let s:lisp_version="' + imp[':version'] + '"')
                                 retval = retval + new_line(retval)
                                 retval = retval + imp[':type'] + ' ' + imp[':version'] + '  Port: ' + str(input_port) + '  Pid: ' + pid + '\n; SWANK ' + ver
@@ -953,7 +969,7 @@ def swank_completions(symbol):
     swank_rex(':simple-completions', cmd, 'nil', 't')
 
 def swank_fuzzy_completions(symbol):
-    cmd = '(swank:fuzzy-completions "' + symbol + '" ' + get_swank_package() + ' :limit 200 :time-limit-in-msec 2000)' 
+    cmd = '(swank:fuzzy-completions "' + symbol + '" ' + get_swank_package() + ' :limit 2000 :time-limit-in-msec 2000)' 
     swank_rex(':fuzzy-completions', cmd, 'nil', 't')
 
 def swank_undefine_function(fn):
@@ -966,8 +982,10 @@ def swank_return_string(s):
     read_string = None
 
 def swank_inspect(symbol):
+    global inspect_package
     cmd = '(swank:init-inspector "' + symbol + '")'
-    swank_rex(':init-inspector', cmd, get_swank_package(), 't')
+    inspect_package = get_swank_package() 
+    swank_rex(':init-inspector', cmd, inspect_package, 't')
 
 def swank_inspect_nth_part(n):
     cmd = '(swank:inspect-nth-part ' + str(n) + ')'
@@ -978,6 +996,8 @@ def swank_inspector_nth_action(n):
     swank_rex(':inspector-call-nth-action', cmd, 'nil', 't', str(n))
 
 def swank_inspector_pop():
+    # Remove the last two entries from the inspect path
+    vim.command('let s:inspect_path = s:inspect_path[:-2]')
     swank_rex(':inspector-pop', '(swank:inspector-pop)', 'nil', 't')
 
 def swank_inspect_in_frame(symbol, n):
@@ -992,13 +1012,21 @@ def swank_inspector_range():
     start = int(vim.eval("b:range_start"))
     end   = int(vim.eval("b:range_end"))
     cmd = '(swank:inspector-range ' + str(end) + " " + str(end+(end-start)) + ')'
-    swank_rex(':inspector-range', cmd, get_swank_package(), 't')
+    swank_rex(':inspector-range', cmd, inspect_package, 't')
 
 def swank_quit_inspector():
+    global inspect_package
     swank_rex(':quit-inspector', '(swank:quit-inspector)', 'nil', 't')
+    inspect_package = ''
+
+def swank_break_on_exception(flag):
+    if flag:
+        swank_rex(':break-on-exception', '(swank:break-on-exception "true")', 'nil', current_thread)
+    else:
+        swank_rex(':break-on-exception', '(swank:break-on-exception "false")', 'nil', current_thread)
 
 def swank_set_break(symbol):
-    cmd = '(swank:sldb-break"' + symbol + '")'
+    cmd = '(swank:sldb-break "' + symbol + '")'
     swank_rex(':sldb-break', cmd, get_package(), 't')
 
 def swank_toggle_trace(symbol):
