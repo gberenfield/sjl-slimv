@@ -1,6 +1,6 @@
 " slimv.vim:    The Superior Lisp Interaction Mode for VIM
 " Version:      0.9.9
-" Last Change:  12 Oct 2012
+" Last Change:  10 Nov 2012
 " Maintainer:   Tamas Kovacs <kovisoft at gmail dot com>
 " License:      This file is placed in the public domain.
 "               No warranty, express or implied.
@@ -346,7 +346,9 @@ endfunction
 " after the last character of the buffer when in insert mode
 function s:EndOfBuffer()
     normal! G$
-    call cursor( line('$'), 99999 )
+    if &virtualedit != 'all'
+        call cursor( line('$'), 99999 )
+    endif
 endfunction
 
 " Position the cursor at the end of the REPL buffer
@@ -448,15 +450,12 @@ function! SlimvSwankResponse()
     let s:refresh_disabled = 1
     silent execute 'python swank_output(1)'
     let s:refresh_disabled = 0
-    let msg = ''
-    redir => msg
+    let s:swank_action = ''
+    let s:swank_result = ''
     silent execute 'python swank_response("")'
-    redir END
 
-    if msg != ''
-        if s:swank_action == ':describe-symbol'
-            echo substitute(msg,'^\n*','','')
-        endif
+    if s:swank_action == ':describe-symbol' && s:swank_result != ''
+        echo substitute(s:swank_result,'^\n*','','')
     endif
     if s:swank_actions_pending
         let s:last_update = -1
@@ -484,8 +483,8 @@ endfunction
 function! SlimvCommandGetResponse( name, cmd, timeout )
     let s:refresh_disabled = 1
     call SlimvCommand( a:cmd )
-    let msg = ''
     let s:swank_action = ''
+    let s:swank_result = ''
     let starttime = localtime()
     let cmd_timeout = a:timeout
     if cmd_timeout == 0
@@ -493,12 +492,10 @@ function! SlimvCommandGetResponse( name, cmd, timeout )
     endif
     while s:swank_action == '' && localtime()-starttime < cmd_timeout
         python swank_output( 0 )
-        redir => msg
         silent execute 'python swank_response("' . a:name . '")'
-        redir END
     endwhile
     let s:refresh_disabled = 0
-    return msg
+    return s:swank_result
 endfunction
 
 " Reload the contents of the REPL buffer from the output file if changed
@@ -518,6 +515,13 @@ function! SlimvRefreshReplBuffer()
 
     if s:swank_connected
         call SlimvSwankResponse()
+    endif
+
+    if exists("s:input_prompt") && s:input_prompt != ''
+        let answer = input( s:input_prompt )
+        unlet s:input_prompt
+        echo ""
+        call SlimvCommand( 'python swank_return("' . answer . '")' )
     endif
 endfunction
 
@@ -667,7 +671,7 @@ if exists("g:lisp_rainbow") && g:lisp_rainbow != 0
     syn region lispParen8 contained matchgroup=hlLevel8 start="`\=("  skip="|.\{-}|" end=")"  matchgroup=replPrompt end="^\S\+>"me=s-1,re=s-1 contains=@replListCluster,lispParen9
     syn region lispParen9 contained matchgroup=hlLevel9 start="`\=("  skip="|.\{-}|" end=")"  matchgroup=replPrompt end="^\S\+>"me=s-1,re=s-1 contains=@replListCluster,lispParen0
 
- if SlimvGetFiletype() =~ '.*clojure.*'
+ if SlimvGetFiletype() =~ '.*\(clojure\|scheme\).*'
     syn region lispParen0           matchgroup=hlLevel0 start="`\=\[" skip="|.\{-}|" end="\]" matchgroup=replPrompt end="^\S\+>"              contains=@replListCluster,lispParen1,replPrompt
     syn region lispParen1 contained matchgroup=hlLevel1 start="`\=\[" skip="|.\{-}|" end="\]" matchgroup=replPrompt end="^\S\+>"me=s-1,re=s-1 contains=@replListCluster,lispParen2
     syn region lispParen2 contained matchgroup=hlLevel2 start="`\=\[" skip="|.\{-}|" end="\]" matchgroup=replPrompt end="^\S\+>"me=s-1,re=s-1 contains=@replListCluster,lispParen3
@@ -803,7 +807,7 @@ function SlimvOpenInspectBuffer()
     noremap  <buffer> <silent>        <F1>   :call SlimvToggleHelp()<CR>
     noremap  <buffer> <silent>        <CR>   :call SlimvHandleEnterInspect()<CR>
     noremap  <buffer> <silent> <Backspace>   :call SlimvSendSilent(['[-1]'])<CR>
-    execute 'noremap <buffer> <silent> ' . g:slimv_leader.'q      :call SlimvQuitInspect()<CR>'
+    execute 'noremap <buffer> <silent> ' . g:slimv_leader.'q      :call SlimvQuitInspect(1)<CR>'
 
     if version < 703
         " conceal mechanism is defined since Vim 7.3
@@ -882,12 +886,17 @@ function SlimvEndUpdate()
 endfunction
 
 " Quit Inspector
-function SlimvQuitInspect()
+function SlimvQuitInspect( force )
     " Clear the contents of the Inspect buffer
+    if exists( 'b:inspect_pos' )
+        unlet b:inspect_pos
+    endif
     setlocal noreadonly
     silent! %d
     call SlimvEndUpdate()
-    call SlimvCommand( 'python swank_quit_inspector()' )
+    if a:force
+        call SlimvCommand( 'python swank_quit_inspector()' )
+    endif
     b #
 endfunction
 
@@ -976,7 +985,7 @@ endfunction
 
 " Set 'iskeyword' option depending on file type
 function! s:SetKeyword()
-    if SlimvGetFiletype() =~ '.*clojure.*'
+    if SlimvGetFiletype() =~ '.*\(clojure\|scheme\).*'
         setlocal iskeyword+=+,-,*,/,%,<,=,>,:,$,?,!,@-@,94,~,#,\|,&
     else
         setlocal iskeyword+=+,-,*,/,%,<,=,>,:,$,?,!,@-@,94,~,#,\|,&,.,{,},[,]
@@ -1326,11 +1335,11 @@ function! s:CloseForm( lines )
             " We are outside of strings and comments, now we shall count parens
             if form[i] == '('
                 let end = ')' . end
-            elseif form[i] == '[' && SlimvGetFiletype() =~ '.*clojure.*'
+            elseif form[i] == '[' && SlimvGetFiletype() =~ '.*\(clojure\|scheme\).*'
                 let end = ']' . end
-            elseif form[i] == '{' && SlimvGetFiletype() =~ '.*clojure.*'
+            elseif form[i] == '{' && SlimvGetFiletype() =~ '.*\(clojure\|scheme\).*'
                 let end = '}' . end
-            elseif form[i] == ')' || ((form[i] == ']' || form[i] == '}') && SlimvGetFiletype() =~ '.*clojure.*')
+            elseif form[i] == ')' || ((form[i] == ']' || form[i] == '}') && SlimvGetFiletype() =~ '.*\(clojure\|scheme\).*')
                 if len( end ) == 0 || end[0] != form[i]
                     " Oops, too many closing parens or invalid closing paren
                     return 'ERROR'
@@ -1408,7 +1417,7 @@ endfunction
 
 " Return Lisp source code indentation at the given line
 function! SlimvIndent( lnum )
-    if a:lnum <= 1
+    if &autoindent == 0 || a:lnum <= 1
         " Start of the file
         return 0
     endif
@@ -1482,7 +1491,7 @@ function! SlimvIndent( lnum )
     normal! 0
     let [l, c] = searchpairpos( '(', '', ')', 'bW', s:skip_sc, backline )
     if l > 0
-        if SlimvGetFiletype() =~ '.*clojure.*'
+        if SlimvGetFiletype() =~ '.*\(clojure\|scheme\).*'
             " Is this a clojure form with [] binding list?
             call winrestview( oldpos )
             let [lb, cb] = searchpairpos( '\[', '', '\]', 'bW', s:skip_sc, backline )
@@ -1867,7 +1876,9 @@ function! SlimvHandleEnterRepl()
         endif
     else
         " Send current command line for evaluation
-        call cursor( 0, 99999 )
+        if &virtualedit != 'all'
+            call cursor( 0, 99999 )
+        endif
         call SlimvSendCommand(0)
     endif
     return ''
@@ -1928,6 +1939,15 @@ function! SlimvHandleEnterSldb()
     execute "normal! \<CR>"
 endfunction
 
+" Restore Inspector cursor position if the referenced title has already been visited
+function SlimvSetInspectPos( title )
+    if exists( 'b:inspect_pos' ) && has_key( b:inspect_pos, a:title )
+        call winrestview( b:inspect_pos[a:title] )
+    else
+        normal! gg0
+    endif
+endfunction
+
 " Handle normal mode 'Enter' keypress in the Inspector buffer
 function! SlimvHandleEnterInspect()
     let line = getline('.')
@@ -1958,6 +1978,14 @@ function! SlimvHandleEnterInspect()
     if l == line( '.' )
         " Keep the relevant part of the line
         let line = strpart( line, c )
+    endif
+
+    if exists( 'b:inspect_title' ) && b:inspect_title != ''
+        " Save cursor position in case we'll return to this page later on
+        if !exists( 'b:inspect_pos' )
+            let b:inspect_pos = {}
+        endif
+	let b:inspect_pos[b:inspect_title] = winsaveview()
     endif
 
     if line[0] == '['
@@ -2003,6 +2031,16 @@ function! SlimvHandleEnterInspect()
             if item != ''
                 " Add item name to the object path
                 let entry = matchstr(line, '\[\d\+\]\s*\zs.\{-}\ze\s*\[\]}')
+                if entry == ''
+                    let entry = matchstr(line, '\[\d\+\]\s*\zs.*')
+                endif
+                if entry == ''
+                    let entry = 'Unknown object'
+                endif
+                if len( entry ) > 40
+                    " Crop if too long
+                    let entry = strpart( entry, 0, 37 ) . '...'
+                endif
                 let s:inspect_path = s:inspect_path + [entry]
             endif
         endif
@@ -2156,7 +2194,13 @@ function! SlimvArglist( ... )
         let [l0, c0] = searchpairpos( '(', '', ')', 'nbW', s:skip_sc, matchb )
         if l0 > 0
             " Found opening paren, let's find out the function name
-            let arg = matchstr( getline(l0), '\<\k*\>', c0 )
+            let arg = ''
+            while arg == '' && l0 <= l
+                let funcline = substitute( getline(l0), ';.*$', '', 'g' )
+                let arg = matchstr( funcline, '\<\k*\>', c0 )
+                let l0 = l0 + 1
+                let c0 = 0
+            endwhile
             if arg != ''
                 " Ask function argument list from SWANK
                 call SlimvFindPackage()
@@ -2169,7 +2213,8 @@ function! SlimvArglist( ... )
                     set noshowmode
                     let msg = substitute( msg, "\n", "", "g" )
                     redraw
-                    if match( msg, arg ) != 1
+                    " Use \V ('very nomagic') for exact string match instead of regex 
+                    if match( msg, "\\V" . arg ) != 1
                         " Function name is not received from REPL
                         call SlimvShortEcho( "(" . arg . ' ' . msg[1:] )
                     else
